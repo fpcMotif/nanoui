@@ -164,7 +164,8 @@ pub const Renderer = struct {
         self.rest();
         if (self.hidden) return;
         self.hidden = true;
-        objc.msg(void, self.layer, "setDrawableSize:", .{objc.CGSize{ .width = 1, .height = 1 }});    }
+        objc.msg(void, self.layer, "setDrawableSize:", .{objc.CGSize{ .width = 1, .height = 1 }});
+    }
 
     /// Draws `instances` over `clear` into the window, sized `size` points.
     pub fn draw(self: *Renderer, instances: []const Instance, atlas: objc.Object, size: types.Size, clear: types.Color) void {

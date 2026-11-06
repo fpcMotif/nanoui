@@ -42,7 +42,7 @@ pub const Glass = struct {
     }
 
     pub fn deinit(g: *Glass) void {
-        for ([_]?objc.Object{ g.a, g.b }) |t| if (t) |tex| objc.release(tex);
+        g.rest();
         objc.release(g.pipeline);
         objc.release(g.down);
         objc.release(g.blur);
