@@ -48,6 +48,14 @@ pub const Glass = struct {
         objc.release(g.blur);
     }
 
+    pub fn rest(g: *Glass) void {
+        for ([_]*?objc.Object{ &g.a, &g.b }) |slot| if (slot.*) |t| objc.release(t);
+        g.a = null;
+        g.b = null;
+        g.w = 0;
+        g.h = 0;
+    }
+
     fn kernel(device: objc.Object, library: objc.Object, comptime name: []const u8) !objc.Object {
         const f = objc.msg(objc.Object, library, "newFunctionWithName:", .{objc.nsString(name)});
         defer objc.release(f);

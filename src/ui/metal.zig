@@ -22,10 +22,14 @@ pub const Renderer = struct {
     images_texture: ?objc.Object = null,
     images_generation: u64 = std.math.maxInt(u64),
     device: objc.Object,
-    queue: objc.Object,
+    /// Made on the first frame after `rest`: once it has encoded a pass,
+    /// the driver holds about 100 MB for it until it is released.
+    queue: ?objc.Object = null,
     pipeline: objc.Object,
     glass: metal_glass.Glass,
     layer: objc.Object,
+    drawable_size: objc.CGSize = .{ .width = 1, .height = 1 },
+    hidden: bool = false,
     live_resize: bool = false,
     /// Instances go into one of three buffers, reused once the GPU is done
     /// with the frame that last used it.
@@ -44,8 +48,6 @@ pub const Renderer = struct {
         defer pool.pop();
         const device = cf.MTLCreateSystemDefaultDevice() orelse return error.NoMetalDevice;
         errdefer objc.release(device);
-        const queue = objc.msg(objc.Object, device, "newCommandQueue", .{});
-        errdefer objc.release(queue);
 
         var err: ?objc.Object = null;
         const library = objc.msg(?objc.Object, device, "newLibraryWithSource:options:error:", .{
@@ -75,7 +77,7 @@ pub const Renderer = struct {
             defer cf.CGColorSpaceRelease(srgb);
             objc.msg(void, layer, "setColorspace:", .{srgb});
         }
-        return .{ .device = device, .queue = queue, .pipeline = pipeline, .glass = glass, .layer = layer, .in_flight = objc.dispatch_semaphore_create(frames_in_flight) };
+        return .{ .device = device, .pipeline = pipeline, .glass = glass, .layer = layer, .in_flight = objc.dispatch_semaphore_create(frames_in_flight) };
     }
 
     /// Brings the GPU's copy of the image atlas up to date (made on the
@@ -127,23 +129,52 @@ pub const Renderer = struct {
         objc.release(self.layer);
         self.glass.deinit();
         objc.release(self.pipeline);
-        objc.release(self.queue);
+        if (self.queue) |q| objc.release(q);
         objc.release(self.device);
+    }
+
+    /// Lets go of what only drawing needs: the command queue and the glass
+    /// backdrops. Frames in flight keep what they use until they finish;
+    /// the next frame makes them again.
+    pub fn rest(self: *Renderer) void {
+        if (self.queue) |q| objc.release(q);
+        self.queue = null;
+        self.glass.rest();
+    }
+
+    fn commandQueue(self: *Renderer) objc.Object {
+        if (self.queue) |q| return q;
+        const q = objc.msg(objc.Object, self.device, "newCommandQueue", .{});
+        self.queue = q;
+        return q;
     }
 
     pub fn resize(self: *Renderer, size: types.Size, scale: f32) void {
         objc.msg(void, self.layer, "setContentsScale:", .{@as(f64, scale)});
-        objc.msg(void, self.layer, "setDrawableSize:", .{objc.CGSize{
+        self.drawable_size = .{
             .width = @max(1, @round(size.w * scale)),
             .height = @max(1, @round(size.h * scale)),
-        }});
+        };
+        if (!self.hidden) objc.msg(void, self.layer, "setDrawableSize:", .{self.drawable_size});
     }
+
+    /// Rests, and shrinks the layer's drawables to a pixel while nothing
+    /// shows them; the next frame grows them back.
+    pub fn hide(self: *Renderer) void {
+        self.rest();
+        if (self.hidden) return;
+        self.hidden = true;
+        objc.msg(void, self.layer, "setDrawableSize:", .{objc.CGSize{ .width = 1, .height = 1 }});    }
 
     /// Draws `instances` over `clear` into the window, sized `size` points.
     pub fn draw(self: *Renderer, instances: []const Instance, atlas: objc.Object, size: types.Size, clear: types.Color) void {
         const pool = objc.Pool.push();
         defer pool.pop();
         _ = objc.dispatch_semaphore_wait(self.in_flight, objc.DISPATCH_TIME_FOREVER);
+        if (self.hidden) {
+            self.hidden = false;
+            objc.msg(void, self.layer, "setDrawableSize:", .{self.drawable_size});
+        }
         const drawable = objc.msg(?objc.Object, self.layer, "nextDrawable", .{}) orelse {
             _ = objc.dispatch_semaphore_signal(self.in_flight);
             return;
@@ -316,7 +347,7 @@ pub const Renderer = struct {
     }
 
     fn encode(self: *Renderer, texture: objc.Object, instance_buffer: ?objc.Object, instances: []const Instance, atlas: objc.Object, size: types.Size, clear: types.Color, held: *std.ArrayList(*anyopaque)) objc.Object {
-        const cmd = objc.msg(objc.Object, self.queue, "commandBuffer", .{});
+        const cmd = objc.msg(objc.Object, self.commandQueue(), "commandBuffer", .{});
         const buffer = instance_buffer orelse {
             objc.msg(void, pass(cmd, texture, clear), "endEncoding", .{});
             return cmd;

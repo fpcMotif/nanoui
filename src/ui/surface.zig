@@ -36,6 +36,10 @@ pub const Surface = struct {
     last_frame_time: f64 = 0,
     start_time: f64 = 0,
     tick_scheduled: bool = false,
+    /// When the last frame was drawn; the renderer rests once no frame
+    /// came for `rest_after` seconds.
+    last_drawn: f64 = 0,
+    rest_scheduled: bool = false,
     /// Paces animation frames at the display's refresh (CADisplayLink).
     display_link: ?objc.Object = null,
     /// The pace asked of the link: 0 is the display's.
@@ -114,7 +118,7 @@ pub const Surface = struct {
         self.text.deinit();
         if (self.atlas_texture) |t| objc.release(t);
         self.renderer.deinit();
-        if (self.tick_scheduled) self.dead = true else self.gpa.destroy(self);
+        if (self.tick_scheduled or self.rest_scheduled) self.dead = true else self.gpa.destroy(self);
     }
 
     fn updateGeometry(self: *Surface) void {
@@ -168,6 +172,7 @@ pub const Surface = struct {
         if (self.ctx.frame > 0 and !self.visible()) {
             self.pending = true;
             self.setPaced(false);
+            self.renderer.hide();
             return;
         }
         self.pending = false;
@@ -182,6 +187,8 @@ pub const Surface = struct {
         self.renderer.syncImages(&self.text.images);
         self.renderer.textures = c.textures.items;
         self.renderer.draw(self.instances.items, self.atlasTexture(), self.size, c.theme.background);
+        self.last_drawn = now;
+        self.scheduleRest(rest_after);
         self.updateCursor();
         // Something moved under a still pointer, or a value is animating.
         const more = c.animating or r.hot_changed;
@@ -224,7 +231,8 @@ pub const Surface = struct {
 
     /// The window was shown, uncovered or covered.
     pub fn occlusionChanged(self: *Surface) void {
-        if (self.visible() and self.pending) self.frame();
+        if (!self.visible()) return self.renderer.hide();
+        if (self.pending) self.frame();
     }
 
     fn updateCursor(self: *Surface) void {
@@ -250,8 +258,31 @@ pub const Surface = struct {
     fn tick(ptr: ?*anyopaque) callconv(.c) void {
         const self: *Surface = @ptrCast(@alignCast(ptr));
         self.tick_scheduled = false;
-        if (self.dead) return self.gpa.destroy(self);
+        if (self.dead) {
+            if (!self.rest_scheduled) self.gpa.destroy(self);
+            return;
+        }
         self.frame();
+    }
+
+    /// Frames in a burst (hover, scroll, animation) share one queue.
+    const rest_after = 0.25;
+
+    fn scheduleRest(self: *Surface, seconds: f64) void {
+        if (self.rest_scheduled) return;
+        self.rest_scheduled = true;
+        objc.dispatchAfter(@intFromFloat(seconds * std.time.ns_per_s), self, restIfIdle);
+    }
+
+    fn restIfIdle(ptr: ?*anyopaque) callconv(.c) void {
+        const self: *Surface = @ptrCast(@alignCast(ptr));
+        self.rest_scheduled = false;
+        if (self.dead) {
+            if (!self.tick_scheduled) self.gpa.destroy(self);
+            return;
+        }
+        const idle = cf.CACurrentMediaTime() - self.last_drawn;
+        if (idle >= rest_after) self.renderer.rest() else self.scheduleRest(rest_after - idle);
     }
 
     fn setMouse(self: *Surface, event: objc.Object) void {
