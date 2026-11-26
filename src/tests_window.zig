@@ -96,3 +96,70 @@ test "opacity is the window's alpha, at creation and after" {
         try testing.expect(m[0] > 0 and m[1] > 0);
     }
 }
+
+const FrameSpy = struct {
+    calls: u32 = 0,
+    saw_drawable: bool = false,
+    reply: bool = false,
+    fn afterFrame(ctx: ?*anyopaque, s: *ui.Surface) bool {
+        const spy: *@This() = @ptrCast(@alignCast(ctx));
+        spy.calls += 1;
+        spy.saw_drawable = s.renderer.given_drawable != null;
+        return spy.reply;
+    }
+};
+
+fn makeTestLayer(device: objc.Object) objc.Object {
+    const layer = objc.new("CAMetalLayer");
+    objc.msg(void, layer, "setDevice:", .{device});
+    objc.msg(void, layer, "setPixelFormat:", .{@as(objc.NSUInteger, 80)});
+    objc.msg(void, layer, "setDrawableSize:", .{objc.CGSize{ .width = 200, .height = 120 }});
+    return layer;
+}
+
+test "retained redraw invokes after_frame once with the drawable" {
+    const app = try makeApp(testing.allocator);
+    defer freeApp(app);
+    const pool = objc.Pool.push();
+    defer pool.pop();
+    var p: Page = .{};
+    const win = try app.newWindow(.{ .title = "retained", .width = 200, .height = 120, .visible = false, .content = .{ .view = .init(&p, Page.view) } });
+    const surface = win.surface.?;
+    var spy: FrameSpy = .{ .reply = true };
+    surface.after_frame = FrameSpy.afterFrame;
+    surface.after_frame_ctx = &spy;
+    const layer = makeTestLayer(surface.renderer.device);
+    defer objc.release(layer);
+    const drawable = objc.msg(?objc.Object, layer, "nextDrawable", .{}) orelse return error.NoDrawable;
+    surface.is_visible = true;
+    surface.renderer.given_drawable = drawable;
+    defer surface.renderer.given_drawable = null;
+    defer surface.renderer.waitIdle();
+    surface.redrawRetained(0, 1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 1), spy.calls);
+    try testing.expect(spy.saw_drawable);
+    try testing.expect(surface.renderer.live_resize);
+}
+
+test "hidden frameAt clears given_drawable before after_frame" {
+    const app = try makeApp(testing.allocator);
+    defer freeApp(app);
+    const pool = objc.Pool.push();
+    defer pool.pop();
+    var p: Page = .{};
+    const win = try app.newWindow(.{ .title = "hidden", .width = 200, .height = 120, .visible = false, .content = .{ .view = .init(&p, Page.view) } });
+    const surface = win.surface.?;
+    var spy: FrameSpy = .{};
+    surface.after_frame = FrameSpy.afterFrame;
+    surface.after_frame_ctx = &spy;
+    const layer = makeTestLayer(surface.renderer.device);
+    defer objc.release(layer);
+    const drawable = objc.msg(?objc.Object, layer, "nextDrawable", .{}) orelse return error.NoDrawable;
+    surface.is_visible = false;
+    surface.renderer.given_drawable = drawable;
+    defer surface.renderer.given_drawable = null;
+    defer surface.renderer.waitIdle();
+    surface.frameAt(.link, 0, 1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 1), spy.calls);
+    try testing.expect(!spy.saw_drawable);
+}

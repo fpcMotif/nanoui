@@ -309,11 +309,10 @@ pub const Surface = struct {
         a11y.afterFrame(self);
         @import("../play.zig").paint(self.gpa, &self.instances);
         self.frame_in_due = if (c.frame_in) |fi| now + @as(f64, fi) else 0;
-        const t_af0 = if (self.frame_log != null) cf.CACurrentMediaTime() else 0;
-        const native_changed = if (self.after_frame) |af| af(self.after_frame_ctx, self) else false;
+        if (!vis) self.renderer.given_drawable = null;
+        const af = self.runAfterFrame();
         if (self.dead) return;
-        const after_frame_ms = if (self.frame_log != null) (cf.CACurrentMediaTime() - t_af0) * 1000 else 0;
-        const sync = native_changed or self.in_live_resize or self.geometry_changed or self.pending_sync;
+        const sync = af.changed or self.in_live_resize or self.geometry_changed or self.pending_sync;
         self.geometry_changed = false;
         self.pending_sync = false;
         self.afterFocus();
@@ -331,24 +330,7 @@ pub const Surface = struct {
             } else self.setPaced(false);
             return;
         }
-        const presented = self.presentFrame(now, target_in, dur, sync, .{
-            .t = now,
-            .kind = kind,
-            .interval_ms = 0,
-            .duration = dur,
-            .dt = dt,
-            .build_ms = c.stats.build_ms,
-            .layout_ms = c.stats.layout_ms,
-            .paint_ms = c.stats.paint_ms,
-            .after_frame_ms = after_frame_ms,
-            .drawable_wait_ms = 0,
-            .encode_ms = 0,
-            .sync = sync,
-            .nodes = c.stats.nodes,
-            .instances = c.stats.instances,
-            .atlas_reset = false,
-            .animating = c.animating,
-        });
+        const presented = self.presentFrame(now, target_in, dur, sync, .{ .t = now, .kind = kind, .interval_ms = 0, .duration = dur, .dt = dt, .build_ms = c.stats.build_ms, .layout_ms = c.stats.layout_ms, .paint_ms = c.stats.paint_ms, .after_frame_ms = af.ms, .drawable_wait_ms = 0, .encode_ms = 0, .sync = sync, .nodes = c.stats.nodes, .instances = c.stats.instances, .atlas_reset = false, .animating = c.animating });
         self.updateCursor();
         if (!presented) return self.requestFrame();
         if (dy != 0) c.updateHot();
@@ -378,6 +360,14 @@ pub const Surface = struct {
         }
     }
 
+    const AfterFrame = struct { changed: bool, ms: f64 };
+    fn runAfterFrame(self: *Surface) AfterFrame {
+        const t0 = if (self.frame_log != null) cf.CACurrentMediaTime() else 0;
+        const changed = if (self.after_frame) |af| af(self.after_frame_ctx, self) else false;
+        const ms = if (self.frame_log != null and !self.dead) (cf.CACurrentMediaTime() - t0) * 1000 else 0;
+        return .{ .changed = changed, .ms = ms };
+    }
+
     pub fn redrawRetained(self: *Surface, target_in: f64, duration_in: f64) void {
         if (self.in_frame or self.dead) return;
         if (!self.visible() or self.renderer.given_drawable == null) {
@@ -393,26 +383,11 @@ pub const Surface = struct {
         const dur: f64 = if (duration_in > 0) duration_in else fallback_dur;
         if (duration_in > 0) self.link_duration = duration_in;
         const now = if (target_in > 0) target_in else cf.CACurrentMediaTime();
-        const sync = self.pending_sync;
+        const af = self.runAfterFrame();
+        if (self.dead) return;
+        const sync = af.changed or self.pending_sync;
         self.pending_sync = false;
-        const presented = self.presentFrame(now, target_in, dur, sync, .{
-            .t = now,
-            .kind = .retained,
-            .interval_ms = 0,
-            .duration = dur,
-            .dt = @floatCast(dur),
-            .build_ms = 0,
-            .layout_ms = 0,
-            .paint_ms = 0,
-            .after_frame_ms = 0,
-            .drawable_wait_ms = 0,
-            .encode_ms = 0,
-            .sync = sync,
-            .nodes = c.stats.nodes,
-            .instances = self.instances.items.len,
-            .atlas_reset = false,
-            .animating = c.time_driven == .fast,
-        });
+        const presented = self.presentFrame(now, target_in, dur, sync, .{ .t = now, .kind = .retained, .interval_ms = 0, .duration = dur, .dt = @floatCast(dur), .build_ms = 0, .layout_ms = 0, .paint_ms = 0, .after_frame_ms = af.ms, .drawable_wait_ms = 0, .encode_ms = 0, .sync = sync, .nodes = c.stats.nodes, .instances = self.instances.items.len, .atlas_reset = false, .animating = c.time_driven == .fast });
         if (!presented) return self.requestFrame();
         if (self.retained_ready) {
             self.retained_ready = false;
@@ -499,7 +474,7 @@ pub const Surface = struct {
         return self.is_visible;
     }
 
-    fn setPaced(self: *Surface, on: bool) void {
+    pub fn setPaced(self: *Surface, on: bool) void {
         if (self.paced == on) return;
         self.paced = on;
         if (!on) if (self.frame_log) |*fl| {
