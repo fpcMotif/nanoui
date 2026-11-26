@@ -376,12 +376,12 @@ fn scaleDown(gpa: std.mem.Allocator, bgra: []const u8, w: u32, h: u32, stride: u
         for (0..nw) |x| {
             const sx0 = x * w / nw;
             const sx1 = @max(sx0 + 1, (x + 1) * w / nw);
-            var acc: [4]u32 = .{ 0, 0, 0, 0 };
+            var acc: [4]u64 = .{ 0, 0, 0, 0 };
             for (sy0..sy1) |sy| for (sx0..sx1) |sx| {
                 const p = bgra[sy * stride + sx * 4 ..][0..4];
                 for (0..4) |k| acc[k] += p[k];
             };
-            const n: u32 = @intCast((sy1 - sy0) * (sx1 - sx0));
+            const n: u64 = @intCast((sy1 - sy0) * (sx1 - sx0));
             for (0..4) |k| out[(y * nw + x) * 4 + k] = @intCast(acc[k] / n);
         }
     }

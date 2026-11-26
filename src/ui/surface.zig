@@ -332,7 +332,10 @@ pub const Surface = struct {
         }
         const presented = self.presentFrame(now, target_in, dur, sync, .{ .t = now, .kind = kind, .interval_ms = 0, .duration = dur, .dt = dt, .build_ms = c.stats.build_ms, .layout_ms = c.stats.layout_ms, .paint_ms = c.stats.paint_ms, .after_frame_ms = af.ms, .drawable_wait_ms = 0, .encode_ms = 0, .sync = sync, .nodes = c.stats.nodes, .instances = c.stats.instances, .atlas_reset = false, .animating = c.animating });
         self.updateCursor();
-        if (!presented) return self.requestFrame();
+        if (!presented) {
+            self.pending_sync = sync;
+            return self.requestFrame();
+        }
         if (dy != 0) c.updateHot();
         self.updatePacing(now, r.hot_changed);
     }
@@ -341,7 +344,7 @@ pub const Surface = struct {
         const c = &self.ctx;
         const elapsed = (now - self.start_time) - c.caret_moved_at;
         const recent_typing = c.focused_text != null and c.caret_moved_at > 0 and elapsed >= 0 and elapsed < 0.35;
-        const more = c.animating or hot_changed or c.input.down or recent_typing or self.scroll.active(now);
+        const more = self.full_pending or c.animating or hot_changed or c.input.down or recent_typing or self.scroll.active(now);
         if (self.display_link != null) {
             if (more) {
                 self.setRate(null);
@@ -388,7 +391,10 @@ pub const Surface = struct {
         const sync = af.changed or self.pending_sync;
         self.pending_sync = false;
         const presented = self.presentFrame(now, target_in, dur, sync, .{ .t = now, .kind = .retained, .interval_ms = 0, .duration = dur, .dt = @floatCast(dur), .build_ms = 0, .layout_ms = 0, .paint_ms = 0, .after_frame_ms = af.ms, .drawable_wait_ms = 0, .encode_ms = 0, .sync = sync, .nodes = c.stats.nodes, .instances = self.instances.items.len, .atlas_reset = false, .animating = c.time_driven == .fast });
-        if (!presented) return self.requestFrame();
+        if (!presented) {
+            self.pending_sync = sync;
+            return self.requestFrame();
+        }
         if (self.retained_ready) {
             self.retained_ready = false;
             self.updatePacing(now, false);
