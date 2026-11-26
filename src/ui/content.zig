@@ -2,6 +2,7 @@
 //! canvas, or a hole that a native view shows through.
 const types = @import("types.zig");
 const text = @import("text.zig");
+const images = @import("images.zig");
 
 pub const Content = union(enum) {
     none,
@@ -27,7 +28,7 @@ pub const Content = union(enum) {
     /// time it is drawn.
     pub const Image = struct {
         key: u64,
-        bytes: []const u8,
+        source: images.Source,
         opacity: f32 = 1,
         /// Its shape (alpha) filled with this color: a monochrome mark.
         tint: ?types.Color = null,

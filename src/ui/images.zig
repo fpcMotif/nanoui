@@ -54,6 +54,18 @@ pub const Info = struct {
     height: u32,
 };
 
+pub const Source = union(enum) {
+    encoded: []const u8,
+    pixels: Pixels,
+
+    pub const Pixels = struct {
+        bgra: []const u8,
+        width: u32,
+        height: u32,
+        stride: u32 = 0,
+    };
+};
+
 const KeptEntry = struct {
     entry: ?Entry,
     last_frame: u64,
@@ -121,17 +133,25 @@ pub const Images = struct {
 
     /// The picture `k`'s native dimensions (from `bytes` the first time), or null.
     /// Sizing a picture needs only this: it is decoded and packed when drawn.
-    pub fn info(im: *Images, k: u64, bytes: []const u8) ?Info {
-        if (im.headers.get(k)) |h| return h;
-        if (im.headers.count() >= 2048) im.headers.clearRetainingCapacity();
-        const h = probeHeader(bytes);
-        im.headers.put(im.gpa, k, h) catch {};
-        return h;
+    pub fn info(im: *Images, k: u64, src: Source) ?Info {
+        switch (src) {
+            .pixels => |p| return if (pixelsOk(p)) .{ .width = p.width, .height = p.height } else null,
+            .encoded => |bytes| {
+                if (im.headers.get(k)) |h| return h;
+                if (im.headers.count() >= 2048) im.headers.clearRetainingCapacity();
+                const h = probeHeader(bytes);
+                im.headers.put(im.gpa, k, h) catch {};
+                return h;
+            },
+        }
     }
 
-    fn getDecoded(im: *Images, sk: SizedKey, bytes: []const u8) ?Decoded {
+    fn getDecoded(im: *Images, sk: SizedKey, src: Source) ?Decoded {
         if (im.decoded.get(sk)) |d| return d;
-        const d = (if (im.svgs.get(sk.key)) |spec| drawSvg(im.gpa, bytes, spec) else load(im.gpa, bytes, sk.side)) catch null;
+        const d = switch (src) {
+            .encoded => |bytes| if (im.svgs.get(sk.key)) |spec| drawSvg(im.gpa, bytes, spec) else load(im.gpa, bytes, sk.side),
+            .pixels => |p| loadPixels(im.gpa, p, sk.side),
+        } catch null;
         if (d) |x| im.kept_bytes += x.bgra.len;
         im.decoded.put(im.gpa, sk, d) catch {
             if (d) |x| im.gpa.free(x.bgra);
@@ -156,7 +176,7 @@ pub const Images = struct {
     /// picture `k`: decoded once, then packed when drawn like any other.
     pub fn infoSvg(im: *Images, k: u64, bytes: []const u8, spec: SvgSpec) ?Decoded {
         im.svgs.put(im.gpa, k, spec) catch return null;
-        return im.getDecoded(.{ .key = k, .side = spec.width }, bytes);
+        return im.getDecoded(.{ .key = k, .side = spec.width }, .{ .encoded = bytes });
     }
 
     /// The atlas as the CPU renderer reads it.
@@ -170,21 +190,21 @@ pub const Images = struct {
 
     /// The picture `k` in the atlas at `target_px`, packing it (decoding `bytes`
     /// the first time) when it is not there; null if it can't be decoded.
-    pub fn get(im: *Images, k: u64, bytes: []const u8, target_px: u32) ?Entry {
+    pub fn get(im: *Images, k: u64, src: Source, target_px: u32) ?Entry {
         const side = std.math.clamp(target_px, 1, max_side);
         const sk: SizedKey = .{ .key = k, .side = side };
         if (im.entries.getPtr(sk)) |ke| {
             ke.last_frame = im.frame;
             return ke.entry;
         }
-        if (!im.decoded.contains(sk)) {
+        if (src == .encoded and !im.decoded.contains(sk)) {
             if (im.decodes_left == 0) {
                 im.wants_frame = true;
                 return null;
             }
             im.decodes_left -= 1;
         }
-        const d = im.getDecoded(sk, bytes) orelse {
+        const d = im.getDecoded(sk, src) orelse {
             im.entries.put(im.gpa, sk, .{ .entry = null, .last_frame = im.frame }) catch {};
             return null;
         };
@@ -309,13 +329,47 @@ fn decode(gpa: std.mem.Allocator, bytes: []const u8) !Raw {
 
 const Scaled = struct { w: u32, h: u32, bgra: []u8 };
 
+fn pixelsOk(p: Source.Pixels) bool {
+    if (p.width == 0 or p.height == 0) return false;
+    if (@as(u64, p.width) * p.height > 64 * 1024 * 1024) return false;
+    const row_bytes = std.math.mul(usize, p.width, 4) catch return false;
+    const stride: usize = if (p.stride == 0) row_bytes else p.stride;
+    if (stride < row_bytes) return false;
+    const total = std.math.mul(usize, stride, p.height) catch return false;
+    return p.bgra.len >= total;
+}
+
+fn loadPixels(gpa: std.mem.Allocator, p: Source.Pixels, side: u32) !Decoded {
+    if (!pixelsOk(p)) return error.InvalidPixels;
+    const row_bytes: usize = @as(usize, p.width) * 4;
+    const stride: usize = if (p.stride == 0) row_bytes else p.stride;
+    const limit = @min(side, max_side);
+    if (@max(p.width, p.height) <= limit) {
+        const out = try gpa.alloc(u8, row_bytes * p.height);
+        if (stride == row_bytes) {
+            @memcpy(out, p.bgra[0..out.len]);
+        } else {
+            for (0..p.height) |y| {
+                @memcpy(out[y * row_bytes ..][0..row_bytes], p.bgra[y * stride ..][0..row_bytes]);
+            }
+        }
+        return .{ .width = p.width, .height = p.height, .w = p.width, .h = p.height, .bgra = out };
+    }
+    const scaled = try scaleDown(gpa, p.bgra, p.width, p.height, stride, limit);
+    return .{ .width = p.width, .height = p.height, .w = scaled.w, .h = scaled.h, .bgra = scaled.bgra };
+}
+
 /// The picture within `max_side`, averaging the pixels each new one covers.
 fn fit(gpa: std.mem.Allocator, bgra: []u8, w: u32, h: u32, limit: u32) !Scaled {
+    if (@max(w, h) <= limit) return .{ .w = w, .h = h, .bgra = bgra };
+    return scaleDown(gpa, bgra, w, h, @as(usize, w) * 4, limit);
+}
+
+fn scaleDown(gpa: std.mem.Allocator, bgra: []const u8, w: u32, h: u32, stride: usize, limit: u32) !Scaled {
     const longest = @max(w, h);
-    if (longest <= limit) return .{ .w = w, .h = h, .bgra = bgra };
-    const nw = @max(1, w * limit / longest);
-    const nh = @max(1, h * limit / longest);
-    const out = try gpa.alloc(u8, nw * nh * 4);
+    const nw = @max(1, @as(u32, @intCast(@as(u64, w) * limit / longest)));
+    const nh = @max(1, @as(u32, @intCast(@as(u64, h) * limit / longest)));
+    const out = try gpa.alloc(u8, @as(usize, nw) * nh * 4);
     for (0..nh) |y| {
         const sy0 = y * h / nh;
         const sy1 = @max(sy0 + 1, (y + 1) * h / nh);
@@ -324,7 +378,7 @@ fn fit(gpa: std.mem.Allocator, bgra: []u8, w: u32, h: u32, limit: u32) !Scaled {
             const sx1 = @max(sx0 + 1, (x + 1) * w / nw);
             var acc: [4]u32 = .{ 0, 0, 0, 0 };
             for (sy0..sy1) |sy| for (sx0..sx1) |sx| {
-                const p = bgra[(sy * w + sx) * 4 ..][0..4];
+                const p = bgra[sy * stride + sx * 4 ..][0..4];
                 for (0..4) |k| acc[k] += p[k];
             };
             const n: u32 = @intCast((sy1 - sy0) * (sx1 - sx0));
@@ -342,13 +396,13 @@ test "pictures pack, scale down and come back by key" {
     var px = [_]u8{ 0, 0, 255, 255, 128, 0, 0, 128 };
     const bytes = try @import("png.zig").encode(gpa, .{ .bytes = &px, .width = 2, .height = 1 });
     defer gpa.free(bytes);
-    const e = im.get(Images.key("a.png"), bytes, max_side).?;
+    const e = im.get(Images.key("a.png"), .{ .encoded = bytes }, max_side).?;
     try std.testing.expectEqual(@as(u32, 2), e.width);
     try std.testing.expectEqualSlices(u8, &px, im.pixels[0..8]);
     const gen = im.generation;
-    _ = im.get(Images.key("a.png"), bytes, max_side);
+    _ = im.get(Images.key("a.png"), .{ .encoded = bytes }, max_side);
     try std.testing.expectEqual(gen, im.generation);
-    try std.testing.expect(im.get(Images.key("bad"), "not an image", max_side) == null);
+    try std.testing.expect(im.get(Images.key("bad"), .{ .encoded = "not an image" }, max_side) == null);
     // Too big: averaged down to the longest side.
     const big = try gpa.alloc(u8, 2048 * 2 * 4);
     defer gpa.free(big);
